@@ -104,7 +104,7 @@ func (b *BuildFlags) Run() error {
 	}
 	defer cleanup()
 
-	imgSHA, err := export(group, localLaunchDir, b.RepoName, group.RunImage, !b.Publish, !b.Publish)
+	imgSHA, err := export(&group, localLaunchDir, b.RepoName, group.RunImage, b.Publish)
 	if err != nil {
 		return err
 	}

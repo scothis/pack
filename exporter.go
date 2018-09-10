@@ -1,26 +1,29 @@
 package pack
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
+	"github.com/BurntSushi/toml"
 	"github.com/buildpack/lifecycle"
 	"github.com/buildpack/packs"
 	"github.com/buildpack/packs/img"
 )
 
-func export(group lifecycle.BuildpackGroup, launchDir, repoName, stackName string, useDaemon, useDaemonStack bool) (string, error) {
-	if useDaemon {
-		return exportDaemon(group, launchDir, repoName, stackName)
-	} else {
+func export(group *lifecycle.BuildpackGroup, launchDir, repoName, stackName string, publish bool) (string, error) {
+	if publish {
 		return exportRegistry(group, launchDir, repoName, stackName)
+	} else {
+		return exportDaemon(group, launchDir, repoName, stackName)
 	}
 }
 
-func exportRegistry(group lifecycle.BuildpackGroup, launchDir, repoName, stackName string) (string, error) {
+func exportRegistry(group *lifecycle.BuildpackGroup, launchDir, repoName, stackName string) (string, error) {
 	origImage, err := readImage(repoName, false)
 	if err != nil {
 		return "", err
@@ -69,7 +72,7 @@ func exportRegistry(group lifecycle.BuildpackGroup, launchDir, repoName, stackNa
 	return sha.String(), nil
 }
 
-func exportDaemon(group lifecycle.BuildpackGroup, launchDir, repoName, stackName string) (string, error) {
+func exportDaemon(group *lifecycle.BuildpackGroup, launchDir, repoName, stackName string) (string, error) {
 	var dockerFile string
 	dockerFile += "FROM " + stackName + "\n"
 	dockerFile += "ADD --chown=packs:packs app /launch/app\n"
@@ -129,6 +132,70 @@ func exportDaemon(group lifecycle.BuildpackGroup, launchDir, repoName, stackName
 	}
 
 	// Layers
-	// b, err := exec.Command("docker", "inspect", repoName, "-f", "{{json .RootFS.Layers}}").Output()
+	b, err := exec.Command("docker", "inspect", repoName, "-f", "{{json .RootFS.Layers}}").Output()
+	if err != nil {
+		return "", err
+	}
+	var imgLayers []string
+	if err := json.Unmarshal(b, &imgLayers); err != nil {
+		return "", err
+	}
+
+	runLayerIDX := len(imgLayers) - numLayers - 3
+	metadata := packs.BuildMetadata{
+		RunImage: packs.RunImageMetadata{
+			Name: stackName,
+			SHA:  imgLayers[runLayerIDX],
+		},
+		App: packs.AppMetadata{
+			SHA: imgLayers[runLayerIDX+1],
+		},
+		Config: packs.ConfigMetadata{
+			SHA: imgLayers[runLayerIDX+2],
+		},
+		Buildpacks: []packs.BuildpackMetadata{},
+	}
+	bpLayerIDX := runLayerIDX + 2
+	for _, buildpack := range group.Buildpacks {
+		layers := make(map[string]packs.LayerMetadata)
+		for _, tomlFile := range bpLayers[buildpack.ID] {
+			name := strings.TrimSuffix(filepath.Base(tomlFile), ".toml")
+			if name == "launch" {
+				continue
+			}
+			bpLayerIDX++
+			var data interface{}
+			if _, err := toml.DecodeFile(tomlFile, &data); err != nil {
+				return "", err
+			}
+			layers[name] = packs.LayerMetadata{
+				SHA:  imgLayers[bpLayerIDX],
+				Data: data,
+			}
+		}
+		metadata.Buildpacks = append(metadata.Buildpacks, packs.BuildpackMetadata{
+			Key:    buildpack.ID,
+			Layers: layers,
+		})
+	}
+	b, err = json.Marshal(metadata)
+	if err != nil {
+		return "", err
+	}
+	fmt.Printf("\n*** METADATA: %s\n\n", b)
+
+	cmd = exec.Command(
+		"docker", "build",
+		"-t", repoName,
+		"-",
+	)
+	// lastLayer := strings.TrimPrefix(imgLayers[len(imgLayers)-1], "sha256:")
+	cmd.Stdin = strings.NewReader(fmt.Sprintf("FROM %s\nLABEL sh.packs.build '%s'\n", repoName, b))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
 	return "TODO", nil
 }
